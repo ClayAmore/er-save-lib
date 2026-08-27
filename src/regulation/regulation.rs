@@ -51,6 +51,11 @@ const DCX_COMPRESSED_SIZE_OFFSET: usize = 0x20;
 // The IV is one block long, and the encrypted part is padded to whole blocks.
 const AES_BLOCK_LEN: usize = 0x10;
 
+// The regulation sits in a fixed slot in the save file, so a header claiming more than
+// the slot holds is corrupt. Reading it would run past the slot and leave the enclosing
+// section with a negative number of bytes left, so bound the header before trusting it.
+const MAX_REGULATION_LEN: usize = 0x240020;
+
 #[repr(C)]
 #[derive(PartialEq, Debug)]
 pub struct Regulation {
@@ -81,6 +86,7 @@ impl<'a> DekuReader<'a, Ctx> for Regulation {
                 let _ = reader.read_bytes(PROBE_LEN, &mut probe)?;
 
                 let size = Self::size_from_dcx_header(&probe)
+                    .filter(|size| (PROBE_LEN..=MAX_REGULATION_LEN).contains(size))
                     .or_else(|| Self::ver_size_map().get(&version).copied())
                     .filter(|size| *size >= PROBE_LEN)
                     .ok_or_else(|| {
@@ -275,9 +281,17 @@ impl Regulation {
 fn derived_size_matches_ver_size_map() {
     let save = crate::Save::from_path("./test/ER0000.sl2").unwrap();
     let version = save.user_data_11.version;
-    let expected = Regulation::ver_size_map()
+    let expected = *Regulation::ver_size_map()
         .get(&version)
         .expect("test save should be a version the map knows");
 
-    assert_eq!(save.user_data_11.regulation.raw.len(), *expected);
+    let raw = &save.user_data_11.regulation.raw;
+    assert_eq!(raw.len(), expected);
+
+    // Read the size back from the header alone. Without this the assertion above would
+    // still hold if the header were unreadable and the map fallback had answered.
+    assert_eq!(
+        Regulation::size_from_dcx_header(&raw[..PROBE_LEN]),
+        Some(expected)
+    );
 }
