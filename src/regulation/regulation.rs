@@ -39,6 +39,23 @@ pub(crate) enum RegulationIdentifier {
     Size(usize),
 }
 
+// Bytes read before the regulation size is known: the 16 byte IV followed by the
+// five AES blocks that cover the DCX header up to and including `compressed_size`.
+const PROBE_LEN: usize = 0x60;
+
+// Layout of the decrypted DCX header, see `DCXZSTD`.
+const DCX_MAGIC: [u8; 4] = [b'D', b'C', b'X', 0];
+const DCX_HEADER_LEN: usize = 0x4c;
+const DCX_COMPRESSED_SIZE_OFFSET: usize = 0x20;
+
+// The IV is one block long, and the encrypted part is padded to whole blocks.
+const AES_BLOCK_LEN: usize = 0x10;
+
+// The regulation sits in a fixed slot in the save file, so a header claiming more than
+// the slot holds is corrupt. Reading it would run past the slot and leave the enclosing
+// section with a negative number of bytes left, so bound the header before trusting it.
+const MAX_REGULATION_LEN: usize = 0x240020;
+
 #[repr(C)]
 #[derive(PartialEq, Debug)]
 pub struct Regulation {
@@ -58,27 +75,40 @@ impl<'a> DekuReader<'a, Ctx> for Regulation {
         // Grab regulation_identifier from the context params
         let (_, regulation_identifier) = ctx;
 
-        // If the identifer is size then just store it, if it's version then
-        // look up the size from the version to size map.
-        let size = match regulation_identifier {
+        // If the identifer is size then just store it, if it's version then the size
+        // has to be worked out from the regulation itself: the DCX header states how
+        // many compressed bytes follow it, so a new game patch no longer needs a new
+        // entry in the version to size map. That map stays as a fallback for anything
+        // whose header doesn't read back as DCX.
+        let (size, probe) = match regulation_identifier {
             RegulationIdentifier::Version(version) => {
-                if let Some(size) = Self::ver_size_map().get(&version) {
-                    size.to_owned()
-                } else {
-                    return Err(DekuError::Parse(Cow::from(format!(
-                        "Failed to fetch regulation size from version: {}",
-                        version
-                    ))));
-                }
+                let mut probe = vec![0; PROBE_LEN];
+                let _ = reader.read_bytes(PROBE_LEN, &mut probe)?;
+
+                let size = Self::size_from_dcx_header(&probe)
+                    .filter(|size| (PROBE_LEN..=MAX_REGULATION_LEN).contains(size))
+                    .or_else(|| Self::ver_size_map().get(&version).copied())
+                    .filter(|size| *size >= PROBE_LEN)
+                    .ok_or_else(|| {
+                        DekuError::Parse(Cow::from(format!(
+                            "Failed to fetch regulation size from version: {}",
+                            version
+                        )))
+                    })?;
+
+                (size, probe)
             }
-            RegulationIdentifier::Size(size) => size,
+            RegulationIdentifier::Size(size) => (size, Vec::new()),
         };
 
-        // Prepare a buffer to read the regulation bytes.
-        let mut bytes = vec![0; size];
+        // Prepare a buffer to read the regulation bytes, keeping what the probe above
+        // already consumed.
+        let probed = probe.len();
+        let mut bytes = probe;
+        bytes.resize(size, 0);
 
-        // Read the regulation bytes.
-        let _ = reader.read_bytes(size, &mut bytes)?;
+        // Read the remaining regulation bytes.
+        let _ = reader.read_bytes(size - probed, &mut bytes[probed..])?;
 
         // Store a copy of the bytes to use when write. This is due
         // to the zstd compression configuartion being unknown. Because of that
@@ -189,6 +219,27 @@ impl Regulation {
         Err(RegulationParseError::ParamNotFound(P::PARAM_NAME))
     }
 
+    // The regulation is a DCX container whose header states how many compressed
+    // bytes follow it. Decrypting the first blocks is therefore enough to work out
+    // the total size, which is what the save file doesn't spell out on its own.
+    fn size_from_dcx_header(probe: &[u8]) -> Option<usize> {
+        let header = Self::decrypt(probe).ok()?;
+
+        if header.get(..DCX_MAGIC.len())? != DCX_MAGIC {
+            return None;
+        }
+
+        let field = header.get(DCX_COMPRESSED_SIZE_OFFSET..DCX_COMPRESSED_SIZE_OFFSET + 4)?;
+        let compressed_size = usize::try_from(i32::from_be_bytes(field.try_into().ok()?)).ok()?;
+
+        let padded = DCX_HEADER_LEN
+            .checked_add(compressed_size)?
+            .checked_add(AES_BLOCK_LEN - 1)?
+            & !(AES_BLOCK_LEN - 1);
+
+        Some(AES_BLOCK_LEN + padded)
+    }
+
     pub(crate) fn ver_size_map() -> &'static HashMap<u32, usize> {
         static VER_SIZE_MAP: OnceLock<HashMap<u32, usize>> = OnceLock::new();
         VER_SIZE_MAP.get_or_init(|| {
@@ -217,7 +268,30 @@ impl Regulation {
                 (11501000, 2036272),
                 (11601000, 2036272),
                 (11611000, 2036272),
+                (11701000, 2045728),
             ])
         })
     }
+}
+
+// The size derived from the DCX header has to agree with the map the library used
+// before, otherwise every save known to parse today would start reading the wrong
+// number of bytes.
+#[test]
+fn derived_size_matches_ver_size_map() {
+    let save = crate::Save::from_path("./test/ER0000.sl2").unwrap();
+    let version = save.user_data_11.version;
+    let expected = *Regulation::ver_size_map()
+        .get(&version)
+        .expect("test save should be a version the map knows");
+
+    let raw = &save.user_data_11.regulation.raw;
+    assert_eq!(raw.len(), expected);
+
+    // Read the size back from the header alone. Without this the assertion above would
+    // still hold if the header were unreadable and the map fallback had answered.
+    assert_eq!(
+        Regulation::size_from_dcx_header(&raw[..PROBE_LEN]),
+        Some(expected)
+    );
 }
